@@ -1,213 +1,207 @@
-import sys
+"""EAMTA API server.
+
+The browser does the capturing (webcam, mic, optional Bluetooth strap) and the
+music playback; this server estimates heart rate and emotion, runs the session
+state machine, learns per user, and logs everything to SQLite.
+"""
 import os
-import time
-import threading
-from flask import Flask, request, jsonify
+import re
+import sys
+from statistics import median
+
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from inputs.facial import FacialEmotionDetector
-from inputs.rppg import RPPGDetector
-from inputs.text_nlp import TextEmotionDetector
-from inputs.voice import VoiceEmotionDetector
-from fusion.fusion_engine import FusionEngine, ModalityReading
-from music.therapy_engine import MusicTherapyEngine
+from inputs.facial import FacialEmotionDetector  # noqa: E402
+from inputs.text_nlp import TextEmotionDetector  # noqa: E402
+from learning.bandit import CONTEXTS, ContextualUCB  # noqa: E402
+from learning.presets import PRESETS  # noqa: E402
+from session.manager import MODES, SessionManager  # noqa: E402
+from storage.db import Database  # noqa: E402
 
-app = Flask(__name__)
-CORS(app)
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_DB = os.path.join(ROOT, "data", "eamta.db")
+USER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+MAX_RPPG_SAMPLES = 300
+MAX_IMAGE_BYTES = 2_000_000
 
-MOCK_MODE = os.environ.get("EAMTA_MOCK", "false").lower() == "true"
 
-facial  = FacialEmotionDetector(mock_mode=MOCK_MODE)
-rppg    = RPPGDetector(fps=30, mock_mode=MOCK_MODE)
-text    = TextEmotionDetector(use_transformer=False)
-voice   = VoiceEmotionDetector(mock_mode=MOCK_MODE)
-fusion  = FusionEngine(user_id="default", models_dir="models")
-therapy = MusicTherapyEngine(output_dir="music_output")
+def create_app(db_path=None, facial=None, text=None, clock=None):
+    app = Flask(__name__)
+    app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024
+    CORS(app, origins=os.environ.get("EAMTA_CORS_ORIGINS", "http://localhost:3000").split(","))
 
-_state = {
-    "active": False,
-    "user_id": None,
-    "start_time": None,
-    "latest_fused": None,
-    "latest_music": None,
-}
-_lock = threading.Lock()
+    db = Database(db_path or os.environ.get("EAMTA_DB", DEFAULT_DB))
+    manager = SessionManager(db, **({"clock": clock} if clock else {}))
+    facial = facial or FacialEmotionDetector()
+    text = text or TextEmotionDetector(use_transformer=os.environ.get("EAMTA_TEXT_MODEL", "1") != "0")
+    app.extensions["eamta"] = {"db": db, "manager": manager}
 
-def _update_fusion():
-    fused = fusion.fuse()
-    _state["latest_fused"] = {
-        "valence": fused.valence,
-        "arousal": fused.arousal,
-        "emotion_label": fused.emotion_label,
-        "quadrant": fused.quadrant,
-        "confidence": fused.confidence,
-        "modality_contributions": fused.modality_contributions,
-        "weights_used": fused.weights_used,
-    }
-    if _state["active"]:
-        p = therapy.get_current_params(
-            fused.valence, fused.arousal, fused.emotion_label)
-        _state["latest_music"] = {
-            "tempo_bpm": p.tempo_bpm,
-            "scale": p.scale,
-            "instrument": p.instrument,
-            "velocity": p.velocity,
-            "phase": p.phase,
-            "label": p.label,
-            "links": p.links,
-        }
+    def bad(msg, code=400):
+        return jsonify({"error": msg}), code
 
-import cv2
+    def body():
+        return request.get_json(silent=True) or {}
 
-def _hardware_loop():
-    if MOCK_MODE:
-        while True:
-            try:
-                result = rppg.process_frame()
-                if result.get("bpm"):
-                    with _lock:
-                        fusion.add_reading(ModalityReading(
-                            "rppg", result["valence"],
-                            result["arousal"], 0.75))
-            except Exception as e:
-                print(f"[rppg mock] {e}")
-            time.sleep(1)
+    def session_or_404(sid):
+        s = manager.get(sid)
+        if s is None:
+            return None, bad("unknown or finished session", 404)
+        return s, None
 
-    print("[EAMTA] Requesting webcam access...")
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[EAMTA Error] Could not open webcam! Please check Mac permissions.")
-        return
+    @app.get("/api/health")
+    def health():
+        return jsonify({"status": "ok", "face_model": facial.available,
+                        "presets": {k: v["name"] for k, v in PRESETS.items()}, "modes": MODES})
 
-    frame_count = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(0.1)
-            continue
-        
-        # 1. Process rPPG (Heart Rate) every frame
+    @app.post("/api/session/start")
+    def start():
+        data = body()
+        user_id = str(data.get("user_id", "")).strip()
+        if not USER_ID_RE.match(user_id):
+            return bad("user_id must be 1-32 letters, digits, '-' or '_'")
+        mode = data.get("mode", "adaptive")
+        if mode not in MODES:
+            return bad(f"mode must be one of {MODES}")
         try:
-            rppg.add_frame(frame)
-            if frame_count % 30 == 0:  # Calculate BPM every 1 second
-                bpm_result = rppg.compute_and_get_result()
-                if bpm_result:
-                    with _lock:
-                        fusion.add_reading(ModalityReading(
-                            "rppg", bpm_result["valence"], bpm_result["arousal"], 0.75))
-        except Exception as e:
-            print(f"[rppg error] {e}")
+            minutes = float(data.get("music_minutes", 9))
+        except (TypeError, ValueError):
+            return bad("music_minutes must be a number")
+        s = manager.start(user_id, mode, minutes)
+        return jsonify(s.status())
 
-        # 2. Process Facial Emotion every ~2 seconds (60 frames)
-        if frame_count % 60 == 0:
-            try:
-                if _state["active"]:
-                    face_result = facial.analyze_frame(frame)
-                    with _lock:
-                        fusion.add_reading(ModalityReading(
-                            "facial", face_result["valence"], face_result["arousal"], 0.85))
-                        _update_fusion()
-            except Exception as e:
-                print(f"[facial error] {e}")
+    @app.post("/api/session/<sid>/begin")
+    def begin(sid):
+        s, err = session_or_404(sid)
+        if err:
+            return err
+        s.begin()
+        return jsonify(s.status())
 
-        frame_count += 1
-        time.sleep(1/30.0)
+    @app.get("/api/session/<sid>/status")
+    def status(sid):
+        s, err = session_or_404(sid)
+        return err or jsonify(s.status())
 
-threading.Thread(target=_hardware_loop, daemon=True).start()
+    @app.post("/api/session/<sid>/rppg")
+    def rppg(sid):
+        s, err = session_or_404(sid)
+        if err:
+            return err
+        samples = body().get("samples")
+        if not isinstance(samples, list) or len(samples) > MAX_RPPG_SAMPLES:
+            return bad(f"samples must be a list of at most {MAX_RPPG_SAMPLES} [t_ms, r, g, b]")
+        try:
+            est = s.add_rppg_samples(samples)
+        except (TypeError, ValueError):
+            return bad("samples must be numeric [t_ms, r, g, b]")
+        return jsonify({"heart": est})
 
-@app.route("/api/health")
-def health():
-    return jsonify({"status": "ok", "mock_mode": MOCK_MODE})
+    @app.post("/api/session/<sid>/hr")
+    def hr(sid):
+        s, err = session_or_404(sid)
+        if err:
+            return err
+        data = body()
+        try:
+            bpm = float(data["bpm"]) if data.get("bpm") is not None else None
+            rr = [float(x) for x in (data.get("rr_ms") or [])][:20]
+        except (TypeError, ValueError):
+            return bad("bpm and rr_ms must be numbers")
+        return jsonify({"heart": s.add_ble(bpm, rr)})
 
-@app.route("/api/analyze/text", methods=["POST"])
-def analyze_text():
-    data = request.get_json() or {}
-    text_input = data.get("text", "").strip()
-    if not text_input:
-        return jsonify({"error": "No text provided"}), 400
-    result = text.analyze_text(text_input)
-    with _lock:
-        fusion.add_reading(ModalityReading(
-            "text", result["valence"], result["arousal"], 1.0))
-        _update_fusion()
-    return jsonify({
-        "text_result": result,
-        "fused_state": _state["latest_fused"],
-        "music_params": _state["latest_music"],
-    })
+    @app.post("/api/session/<sid>/face")
+    def face(sid):
+        s, err = session_or_404(sid)
+        if err:
+            return err
+        image = body().get("image")
+        if not isinstance(image, str) or len(image) > MAX_IMAGE_BYTES:
+            return bad("image must be a JPEG data URL under 2 MB")
+        return jsonify(s.add_face(facial.analyze_image(image)))
 
-@app.route("/api/analyze/facial", methods=["POST"])
-def analyze_facial():
-    result = facial.run_once()
-    with _lock:
-        fusion.add_reading(ModalityReading(
-            "facial", result["valence"], result["arousal"], 0.85))
-        _update_fusion()
-    return jsonify({
-        "facial_result": result,
-        "fused_state": _state["latest_fused"],
-    })
+    @app.post("/api/session/<sid>/text")
+    def analyze_text(sid):
+        s, err = session_or_404(sid)
+        if err:
+            return err
+        t = str(body().get("text", "")).strip()
+        if not t:
+            return bad("text is required")
+        return jsonify(s.add_text(t, text.analyze_text(t)))
 
-@app.route("/api/analyze/rppg")
-def get_rppg():
-    return jsonify(rppg.process_frame())
+    @app.post("/api/session/<sid>/self_report")
+    def self_report(sid):
+        s, err = session_or_404(sid)
+        if err:
+            return err
+        data = body()
+        try:
+            v, a = int(data["valence"]), int(data["arousal"])
+        except (KeyError, TypeError, ValueError):
+            return bad("valence and arousal (1-9) are required")
+        if not (1 <= v <= 9 and 1 <= a <= 9):
+            return bad("valence and arousal must be between 1 and 9")
+        moment = data.get("moment", "mid")
+        if moment not in ("start", "mid", "end"):
+            return bad("moment must be start, mid or end")
+        return jsonify(s.add_self_report(v, a, moment))
 
-@app.route("/api/session/start", methods=["POST"])
-def start_session():
-    data = request.get_json() or {}
-    user_id = data.get("user_id", "default")
-    emotion = data.get("initial_emotion", "neutral")
-    with _lock:
-        _state["active"] = True
-        _state["user_id"] = user_id
-        _state["start_time"] = time.time()
-        fusion.user_id = user_id
-    session = therapy.start_session(user_id, emotion)
-    return jsonify({
-        "status": "started",
-        "user_id": user_id,
-        "initial_emotion": emotion,
-        "target_emotion": session.target_emotion,
-    })
+    @app.post("/api/session/<sid>/feedback")
+    def feedback(sid):
+        s, err = session_or_404(sid)
+        if err:
+            return err
+        thumbs = body().get("thumbs")
+        if thumbs not in (1, -1):
+            return bad("thumbs must be 1 or -1")
+        return jsonify({"recorded": s.set_thumbs(thumbs)})
 
-@app.route("/api/session/status")
-def session_status():
-    with _lock:
+    @app.post("/api/session/<sid>/end")
+    def end(sid):
+        summary = manager.finish(sid)
+        return jsonify(summary) if summary else bad("unknown or finished session", 404)
+
+    @app.get("/api/users/<user_id>/insights")
+    def insights(user_id):
+        if not USER_ID_RE.match(user_id):
+            return bad("invalid user_id")
+        user = db.one("SELECT * FROM users WHERE id = ?", (user_id,))
+        if not user:
+            return jsonify({"user_id": user_id, "sessions": [], "learning": None})
+        bandit = ContextualUCB.from_history(db.bandit_history(user_id))
+        learning = {ctx: {"best": bandit.best(ctx), "scores": bandit.scores(ctx)} for ctx in CONTEXTS}
+        sessions = db.query(
+            "SELECT s.id, s.mode, s.started_at, s.baseline_bpm, s.heart_source, s.checkin_emotion, s.completed, "
+            "  (SELECT hr_start FROM segments g WHERE g.session_id = s.id AND g.valid = 1 AND g.hr_start IS NOT NULL ORDER BY idx LIMIT 1) AS hr_first, "
+            "  (SELECT hr_end FROM segments g WHERE g.session_id = s.id AND g.valid = 1 AND g.hr_end IS NOT NULL ORDER BY idx DESC LIMIT 1) AS hr_last, "
+            "  (SELECT valence FROM self_reports r WHERE r.session_id = s.id AND moment = 'start' ORDER BY t LIMIT 1) AS v_start, "
+            "  (SELECT valence FROM self_reports r WHERE r.session_id = s.id AND moment = 'end' ORDER BY t DESC LIMIT 1) AS v_end, "
+            "  (SELECT arousal FROM self_reports r WHERE r.session_id = s.id AND moment = 'start' ORDER BY t LIMIT 1) AS a_start, "
+            "  (SELECT arousal FROM self_reports r WHERE r.session_id = s.id AND moment = 'end' ORDER BY t DESC LIMIT 1) AS a_end "
+            "FROM sessions s WHERE s.user_id = ? ORDER BY s.started_at DESC LIMIT 30", (user_id,))
+        by_mode = {}
+        for s in sessions:
+            if s["hr_first"] is not None and s["hr_last"] is not None:
+                s["hr_change"] = round(s["hr_last"] - s["hr_first"], 1)
+                by_mode.setdefault(s["mode"], []).append(s["hr_change"])
         return jsonify({
-            "session": {
-                "active": _state["active"],
-                "user_id": _state["user_id"],
-                "elapsed_s": round(time.time() - _state["start_time"], 1)
-                             if _state["start_time"] else 0,
-            },
-            "emotion": _state["latest_fused"],
-            "music":   _state["latest_music"],
-            "weights": fusion.current_weights(),
+            "user_id": user_id,
+            "resting_bpm": user["resting_bpm"],
+            "presets": {k: v["name"] for k, v in PRESETS.items()},
+            "learning": learning,
+            "learned_segments": len(db.bandit_history(user_id)),
+            "hr_change_by_mode": {m: {"median": round(median(v), 1), "n": len(v)} for m, v in by_mode.items()},
+            "sessions": sessions,
         })
 
-@app.route("/api/session/feedback", methods=["POST"])
-def session_feedback():
-    data = request.get_json() or {}
-    rating = int(data.get("rating", 3))
-    reward = (rating - 1) / 4.0
-    with _lock:
-        fusion.apply_session_reward(reward)
-        _state["active"] = False
-        _state["latest_music"] = None
-    return jsonify({
-        "status": "feedback_received",
-        "reward": reward,
-        "updated_weights": fusion.current_weights(),
-    })
+    return app
 
-@app.route("/api/music/params")
-def music_params():
-    with _lock:
-        return jsonify(_state.get("latest_music") or {})
 
 if __name__ == "__main__":
-    print(f"\n[EAMTA] Starting server — mock_mode={MOCK_MODE}")
-    print("[EAMTA] Open http://localhost:5001/api/health to verify\n")
-    app.run(debug=True, port=5001, threaded=True)
+    port = int(os.environ.get("EAMTA_PORT", "5001"))
+    debug = os.environ.get("EAMTA_DEBUG") == "1"
+    print(f"[EAMTA] http://127.0.0.1:{port}/api/health  (debug={debug})")
+    create_app().run(host="127.0.0.1", port=port, debug=debug, threaded=True)

@@ -22,3 +22,11 @@ npm-debug.log*
 # Models (optional to ignore, but usually large)
 # backend/models/*.json
 # models/*.json
+
+# Session data (personal biometric data - never commit)
+data/
+models/
+backend/models/
+backend/music_output/
+docs/results/real_*.png
+.pytest_cache/

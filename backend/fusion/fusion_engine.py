@@ -1,31 +1,44 @@
-import numpy as np
-import json
-import os
+"""Fuse sensors into one valence/arousal estimate, trusting each one as much as
+it has earned *for this user*.
+
+Every time the user self-reports how they feel (two sliders), each sensor's
+latest reading is compared with the report. A running error is kept per
+sensor and per dimension, and weights are proportional to 1 / (error + eps).
+So if your face is a poor guide to how you feel but your heart rate is a good
+guide to how activated you are, the system learns exactly that.
+
+Heart rate only says how activated someone is (arousal), so it is never used
+for valence.
+"""
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Tuple
-from datetime import datetime
+from typing import Dict, Optional
+
+import numpy as np
+
+MODALITIES = ("face", "text", "heart")
+DIMS = ("valence", "arousal")
+PRIOR_ERROR = {  # starting assumptions before any self-report, in V-A units (range 2)
+    ("face", "valence"): 0.45, ("face", "arousal"): 0.55,
+    ("text", "valence"): 0.40, ("text", "arousal"): 0.55,
+    ("heart", "arousal"): 0.40,
+}
+EPS = 0.1
+ERROR_LEARNING_RATE = 0.3
+STALE_SECONDS = {"face": 15.0, "heart": 15.0, "text": 600.0}
+SMOOTHING = 0.4
+
 
 @dataclass
 class ModalityReading:
     source: str
-    valence: float
-    arousal: float
+    valence: Optional[float]
+    arousal: Optional[float]
     confidence: float = 1.0
     timestamp: float = field(default_factory=time.time)
 
-@dataclass
-class FusedEmotionState:
-    valence: float
-    arousal: float
-    emotion_label: str
-    quadrant: str
-    modality_contributions: dict
-    weights_used: dict
-    confidence: float
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
-def va_to_label(v, a):
+def va_to_label(v: float, a: float):
     if v >= 0 and a >= 0:
         quadrant = "excited"
         label = "elated" if v > 0.5 and a > 0.5 else "happy" if v > 0.3 else "alert"
@@ -33,161 +46,103 @@ def va_to_label(v, a):
         quadrant = "stressed"
         label = "angry" if a > 0.6 and v < -0.4 else "anxious" if a > 0.4 else "tense"
     elif v < 0 and a < 0:
-        quadrant = "sad"
+        quadrant = "low"
         label = "depressed" if v < -0.5 else "fatigued" if a < -0.5 else "sad"
     else:
         quadrant = "calm"
         label = "content" if v > 0.5 else "relaxed" if v > 0.2 else "neutral"
     return label, quadrant
 
-class UCBWeightAdapter:
-    MODALITIES = ["facial", "voice", "text", "rppg"]
 
-    def __init__(self, initial_weights=None):
-        self.counts  = {m: 0   for m in self.MODALITIES}
-        self.rewards = {m: 0.0 for m in self.MODALITIES}
-        self.total_steps = 0
-        self._base = initial_weights or {
-            "facial": 0.30, "voice": 0.30,
-            "text":   0.20, "rppg":  0.20,
-        }
+def sam_to_va(value_1_to_9: float) -> float:
+    """Self-Assessment Manikin slider (1..9) -> [-1, 1]."""
+    return float(np.clip((float(value_1_to_9) - 5.0) / 4.0, -1, 1))
 
-    def get_weights(self):
-        if self.total_steps < len(self.MODALITIES):
-            return dict(self._base)
-        ucb = {}
-        for m in self.MODALITIES:
-            n = self.counts[m]
-            if n == 0:
-                ucb[m] = float("inf")
-            else:
-                ucb[m] = self.rewards[m]/n + 0.5*np.sqrt(2*np.log(self.total_steps)/n)
-        scores = np.array([min(ucb[m], 10) for m in self.MODALITIES])
-        exp_s  = np.exp(scores - scores.max())
-        weights = exp_s / exp_s.sum()
-        return {m: round(float(w), 4) for m, w in zip(self.MODALITIES, weights)}
 
-    def update(self, dominant, reward):
-        if dominant in self.counts:
-            self.counts[dominant]  += 1
-            self.rewards[dominant] += float(np.clip(reward, 0, 1))
-        self.total_steps += 1
+class ReliabilityModel:
+    """Per-user running error for each (sensor, dimension)."""
 
-    def to_dict(self):
-        return {"counts": self.counts, "rewards": self.rewards,
-                "total_steps": self.total_steps, "base": self._base}
+    def __init__(self, errors: Optional[Dict] = None):
+        self.errors = dict(PRIOR_ERROR)
+        self.counts = {k: 0 for k in PRIOR_ERROR}
+        for (m, d), (err, n) in (errors or {}).items():
+            if (m, d) in self.errors:
+                self.errors[(m, d)] = err
+                self.counts[(m, d)] = n
 
-    @classmethod
-    def from_dict(cls, d):
-        a = cls(initial_weights=d.get("base"))
-        a.counts      = d.get("counts", {m: 0   for m in cls.MODALITIES})
-        a.rewards     = d.get("rewards",{m: 0.0 for m in cls.MODALITIES})
-        a.total_steps = d.get("total_steps", 0)
-        return a
+    def weight(self, modality: str, dim: str) -> float:
+        err = self.errors.get((modality, dim))
+        return 0.0 if err is None else 1.0 / (err + EPS)
+
+    def update(self, readings: Dict[str, ModalityReading], reported: Dict[str, float]):
+        changed = []
+        for m, r in readings.items():
+            for d in DIMS:
+                key = (m, d)
+                val = getattr(r, d)
+                if key not in self.errors or val is None:
+                    continue
+                e = abs(val - reported[d])
+                self.errors[key] = (1 - ERROR_LEARNING_RATE) * self.errors[key] + ERROR_LEARNING_RATE * e
+                self.counts[key] += 1
+                changed.append((m, d, round(self.errors[key], 4), self.counts[key]))
+        return changed
+
+    def normalised_weights(self) -> Dict[str, Dict[str, float]]:
+        out = {}
+        for d in DIMS:
+            ws = {m: self.weight(m, d) for m in MODALITIES if (m, d) in self.errors}
+            total = sum(ws.values()) or 1.0
+            out[d] = {m: round(w / total, 4) for m, w in ws.items()}
+        return out
+
 
 class FusionEngine:
-    SMOOTHING_WINDOW = 10
-
-    def __init__(self, user_id="default", models_dir="models"):
-        self.user_id    = user_id
-        self.models_dir = models_dir
-        os.makedirs(models_dir, exist_ok=True)
-        self.ucb = self._load_ucb()
-        self._current_readings: Dict[str, ModalityReading] = {}
-        self._va_history: List[Tuple[float, float]] = []
-        self._label_history: List[str] = []
-        self._current_stable_label: str = "neutral"
-        self._session_dominant: Optional[str] = None
-
-    def _profile_path(self):
-        return os.path.join(self.models_dir, f"{self.user_id}_ucb.json")
-
-    def _load_ucb(self):
-        path = self._profile_path()
-        if os.path.exists(path):
-            try:
-                with open(path) as f:
-                    return UCBWeightAdapter.from_dict(json.load(f))
-            except:
-                pass
-        return UCBWeightAdapter()
-
-    def save_profile(self):
-        with open(self._profile_path(), "w") as f:
-            json.dump(self.ucb.to_dict(), f, indent=2)
+    def __init__(self, reliability: Optional[ReliabilityModel] = None):
+        self.reliability = reliability or ReliabilityModel()
+        self.readings: Dict[str, ModalityReading] = {}
+        self._smoothed = None
 
     def add_reading(self, reading: ModalityReading):
-        self._current_readings[reading.source] = reading
+        self.readings[reading.source] = reading
 
-    def clear_readings(self):
-        self._current_readings = {}
+    def fresh_readings(self, now: Optional[float] = None) -> Dict[str, ModalityReading]:
+        now = now or time.time()
+        return {m: r for m, r in self.readings.items()
+                if now - r.timestamp <= STALE_SECONDS.get(m, 30.0)}
 
-    def fuse(self) -> FusedEmotionState:
-        if not self._current_readings:
-            return FusedEmotionState(0.0, 0.0, self._current_stable_label, "calm", {}, {}, 0.0)
-
-        weights = self.ucb.get_weights()
-        eff_w, total = {}, 0.0
-        for mod, reading in self._current_readings.items():
-            w = weights.get(mod, 0.0) * reading.confidence
-            eff_w[mod] = w
-            total += w
-        if total == 0:
-            total = 1.0
-
-        rv, ra, contributions = 0.0, 0.0, {}
-        for mod, reading in self._current_readings.items():
-            w = eff_w.get(mod, 0.0) / total
-            rv += w * reading.valence
-            ra += w * reading.arousal
-            contributions[mod] = round(w, 4)
-
-        if contributions:
-            self._session_dominant = max(contributions, key=contributions.get)
-
-        self._va_history.append((rv, ra))
-        if len(self._va_history) > self.SMOOTHING_WINDOW:
-            self._va_history.pop(0)
-
-        alpha = 0.4
-        sv, sa = rv, ra
-        for pv, pa in reversed(self._va_history[:-1]):
-            sv = alpha * sv + (1 - alpha) * pv
-            sa = alpha * sa + (1 - alpha) * pa
-
-        fv = round(float(np.clip(sv, -1, 1)), 4)
-        fa = round(float(np.clip(sa, -1, 1)), 4)
-        confidence = round(min(1.0, total / sum(weights.values())), 4)
-        
-        # Stability buffer for labels
-        new_label, quadrant = va_to_label(fv, fa)
-        self._label_history.append(new_label)
-        if len(self._label_history) > 3:
-            self._label_history.pop(0)
-            
-        if len(self._label_history) == 3 and all(l == self._label_history[0] for l in self._label_history):
-            self._current_stable_label = self._label_history[0]
-
-        return FusedEmotionState(fv, fa, self._current_stable_label, quadrant,
-                                 contributions,
-                                 {m: round(w, 4) for m, w in weights.items()},
-                                 confidence)
-
-    def apply_session_reward(self, reward):
-        if self._session_dominant:
-            self.ucb.update(self._session_dominant, reward)
-        self.save_profile()
-
-    def current_weights(self):
-        return self.ucb.get_weights()
-
-if __name__ == "__main__":
-    engine = FusionEngine(user_id="test", models_dir="/tmp/eamta_models")
-    engine.add_reading(ModalityReading("facial", -0.4,  0.6, 0.85))
-    engine.add_reading(ModalityReading("voice",  -0.3,  0.7, 0.90))
-    engine.add_reading(ModalityReading("text",   -0.5,  0.5, 1.00))
-    engine.add_reading(ModalityReading("rppg",   -0.2,  0.8, 0.75))
-    state = engine.fuse()
-    print(f"Emotion : {state.emotion_label}")
-    print(f"Valence : {state.valence}  Arousal: {state.arousal}")
-    print(f"Weights : {state.weights_used}")
+    def fuse(self, now: Optional[float] = None) -> Optional[dict]:
+        fresh = self.fresh_readings(now)
+        if not fresh:
+            return None
+        fused, contributions = {}, {}
+        for d in DIMS:
+            num = den = 0.0
+            contrib = {}
+            for m, r in fresh.items():
+                val = getattr(r, d)
+                if val is None:
+                    continue
+                w = self.reliability.weight(m, d) * max(0.0, r.confidence)
+                num += w * val
+                den += w
+                contrib[m] = w
+            fused[d] = num / den if den > 0 else None
+            contributions[d] = {m: round(w / den, 3) for m, w in contrib.items()} if den > 0 else {}
+        if fused["valence"] is None and fused["arousal"] is None:
+            return None
+        v = fused["valence"] if fused["valence"] is not None else 0.0
+        a = fused["arousal"] if fused["arousal"] is not None else 0.0
+        if self._smoothed is None:
+            self._smoothed = (v, a)
+        else:
+            pv, pa = self._smoothed
+            self._smoothed = (SMOOTHING * v + (1 - SMOOTHING) * pv, SMOOTHING * a + (1 - SMOOTHING) * pa)
+        sv, sa = (round(float(np.clip(x, -1, 1)), 4) for x in self._smoothed)
+        label, quadrant = va_to_label(sv, sa)
+        return {
+            "valence": sv, "arousal": sa,
+            "emotion_label": label, "quadrant": quadrant,
+            "contributions": contributions,
+            "valence_known": fused["valence"] is not None,
+        }

@@ -1,86 +1,127 @@
-import numpy as np
+"""Webcam heart rate (remote photoplethysmography, CHROM method).
+
+The browser averages the RGB colour of the skin region (forehead and cheeks)
+on every video frame and sends `[t, r, g, b]` samples here. Only these numbers
+leave the browser - never the video itself.
+
+Pipeline: resample to a uniform rate -> CHROM chrominance projection ->
+band-pass 0.7-3 Hz -> FFT peak = heart rate. A signal-quality score (share of
+spectral power near the peak) tells the rest of the system how much to trust
+each estimate.
+"""
 from collections import deque
-from scipy.signal import butter, filtfilt
 from typing import Optional
 
-FPS_DEFAULT = 30
-WINDOW_SECONDS = 10
+import numpy as np
+from scipy.signal import butter, filtfilt
+
+TARGET_FPS = 30.0
+WINDOW_SECONDS = 10.0
+MIN_SECONDS = 6.0
 BPM_MIN = 42
 BPM_MAX = 180
-RESTING_BPM = 70
+MIN_QUALITY = 0.35          # below this an estimate is reported but flagged unreliable
+DEFAULT_RESTING_BPM = 70.0
+
+
+def chrom_signal(rgb: np.ndarray) -> np.ndarray:
+    """CHROM projection (de Haan & Jeanne, 2013) of an (N, 3) RGB trace."""
+    rgb_norm = rgb / (rgb.mean(axis=0) + 1e-9)
+    xs = 3 * rgb_norm[:, 0] - 2 * rgb_norm[:, 1]
+    ys = 1.5 * rgb_norm[:, 0] + rgb_norm[:, 1] - 1.5 * rgb_norm[:, 2]
+    alpha = xs.std() / (ys.std() + 1e-9)
+    return xs - alpha * ys
+
+
+def bandpass(signal: np.ndarray, fps: float) -> np.ndarray:
+    nyq = fps / 2.0
+    low = (BPM_MIN / 60.0) / nyq
+    high = min(0.99, (BPM_MAX / 60.0) / nyq)
+    b, a = butter(3, [low, high], btype="band")
+    return filtfilt(b, a, signal)
+
+
+def spectrum_bpm(signal: np.ndarray, fps: float):
+    """Return (bpm, quality) from the dominant frequency of `signal`.
+
+    quality = fraction of in-band power within +-6 BPM of the peak and its
+    first harmonic. Clean pulse signals score ~0.5-0.9, noise ~0.1-0.3.
+    """
+    n = len(signal)
+    n_fft = max(4096, 1 << (n - 1).bit_length())  # zero-pad for finer BPM resolution
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / fps)
+    power = np.abs(np.fft.rfft(signal * np.hanning(n), n=n_fft)) ** 2
+    band = (freqs >= BPM_MIN / 60.0) & (freqs <= BPM_MAX / 60.0)
+    if not band.any() or power[band].sum() == 0:
+        return None, 0.0
+    f_band, p_band = freqs[band], power[band]
+    peak_f = f_band[np.argmax(p_band)]
+    tol = 6.0 / 60.0
+    near = (np.abs(f_band - peak_f) <= tol) | (np.abs(f_band - 2 * peak_f) <= tol)
+    quality = float(p_band[near].sum() / p_band.sum())
+    return float(peak_f * 60.0), quality
+
+
+def bpm_to_va(bpm: float, resting_bpm: float):
+    """Map heart rate relative to the user's own resting rate onto valence/arousal.
+
+    Heart rate mainly tells us arousal. The valence nudge is deliberately small:
+    a raised heart rate can be excitement or anxiety.
+    """
+    delta = (bpm - resting_bpm) / 25.0
+    arousal = float(np.tanh(delta))
+    valence = float(np.tanh(-delta * 0.3))
+    return round(valence, 4), round(arousal, 4)
+
 
 class RPPGDetector:
-    def __init__(self, fps=FPS_DEFAULT, mock_mode=False):
+    def __init__(self, fps: float = TARGET_FPS):
         self.fps = fps
-        self.mock_mode = mock_mode
-        self.window_size = fps * WINDOW_SECONDS
-        self.rgb_buffer = deque(maxlen=self.window_size)
+        self.samples = deque()  # (t, r, g, b), t in seconds
 
-    def _chrom_algorithm(self, rgb):
-        rgb_norm = rgb / (rgb.mean(axis=0) + 1e-6)
-        Xs = 3 * rgb_norm[:, 0] - 2 * rgb_norm[:, 1]
-        Ys = 1.5 * rgb_norm[:, 0] + rgb_norm[:, 1] - 1.5 * rgb_norm[:, 2]
-        alpha = Xs.std() / (Ys.std() + 1e-6)
-        return Xs - alpha * Ys
+    def reset(self):
+        self.samples.clear()
 
-    def _bandpass(self, signal):
-        nyq = self.fps / 2.0
-        low = max(0.01, (BPM_MIN / 60.0) / nyq)
-        high = min(0.99, (BPM_MAX / 60.0) / nyq)
-        b, a = butter(3, [low, high], btype='band')
-        return filtfilt(b, a, signal)
+    def add_samples(self, samples):
+        """samples: iterable of [t_ms, r, g, b] from the browser."""
+        for s in samples:
+            if len(s) != 4:
+                continue
+            t, r, g, b = (float(x) for x in s)
+            t /= 1000.0
+            if self.samples and t <= self.samples[-1][0]:
+                continue  # drop out-of-order / duplicate frames
+            self.samples.append((t, r, g, b))
+        if self.samples:
+            cutoff = self.samples[-1][0] - WINDOW_SECONDS
+            while self.samples and self.samples[0][0] < cutoff:
+                self.samples.popleft()
 
-    def _fft_bpm(self, signal):
-        freqs = np.fft.rfftfreq(len(signal), d=1.0 / self.fps)
-        mags = np.abs(np.fft.rfft(signal * np.hanning(len(signal))))
-        mask = (freqs >= BPM_MIN / 60.0) & (freqs <= BPM_MAX / 60.0)
-        if not mask.any():
-            return RESTING_BPM
-        return float(freqs[mask][np.argmax(mags[mask])]) * 60.0
-
-    def compute_bpm(self):
-        if len(self.rgb_buffer) < self.window_size // 2:
+    def _uniform_trace(self) -> Optional[np.ndarray]:
+        if len(self.samples) < 10:
             return None
-        rgb = np.array(list(self.rgb_buffer), dtype=np.float64)
-        return round(self._fft_bpm(self._bandpass(self._chrom_algorithm(rgb))), 1)
+        arr = np.array(self.samples, dtype=np.float64)
+        t = arr[:, 0]
+        if t[-1] - t[0] < MIN_SECONDS:
+            return None
+        grid = np.arange(t[0], t[-1], 1.0 / self.fps)
+        return np.stack([np.interp(grid, t, arr[:, c]) for c in (1, 2, 3)], axis=1)
 
-    def bpm_to_stress(self, bpm):
-        delta = (bpm - RESTING_BPM) / 40.0
-        arousal = float(np.tanh(delta))
-        valence = float(np.tanh(-delta * 0.5))
-        if bpm < 65:     label = "very_calm"
-        elif bpm < 80:   label = "calm"
-        elif bpm < 95:   label = "neutral"
-        elif bpm < 110:  label = "elevated"
-        else:            label = "stressed"
-        return {"bpm": round(bpm, 1), "stress_label": label,
-                "arousal": round(arousal, 4), "valence": round(valence, 4),
-                "source": "rppg"}
-
-    def add_frame(self, frame):
-        # Crop to center forehead region roughly
-        h, w = frame.shape[:2]
-        crop = frame[int(h*0.2):int(h*0.4), int(w*0.4):int(w*0.6)]
-        # Extract mean RGB values
-        rgb_mean = crop.mean(axis=(0, 1))
-        self.rgb_buffer.append(rgb_mean)
-
-    def compute_and_get_result(self):
-        bpm = self.compute_bpm()
-        if bpm:
-            return self.bpm_to_stress(bpm)
-        return None
-
-    def process_frame(self):
-        # Kept for backward compatibility with mock mode
-        return self._mock_result()
-
-    def _mock_result(self):
-        import random
-        bpm = max(BPM_MIN, min(BPM_MAX, random.gauss(75, 15)))
-        return self.bpm_to_stress(bpm)
-
-if __name__ == "__main__":
-    d = RPPGDetector(mock_mode=True)
-    for i in range(3):
-        print(d.process_frame())
+    def estimate(self, resting_bpm: float = DEFAULT_RESTING_BPM) -> Optional[dict]:
+        rgb = self._uniform_trace()
+        if rgb is None:
+            return None
+        pulse = bandpass(chrom_signal(rgb), self.fps)
+        bpm, quality = spectrum_bpm(pulse, self.fps)
+        if bpm is None:
+            return None
+        valence, arousal = bpm_to_va(bpm, resting_bpm)
+        return {
+            "bpm": round(bpm, 1),
+            "quality": round(quality, 3),
+            "reliable": quality >= MIN_QUALITY,
+            "valence": valence,
+            "arousal": arousal,
+            "window_s": round(len(rgb) / self.fps, 1),
+            "source": "rppg",
+        }

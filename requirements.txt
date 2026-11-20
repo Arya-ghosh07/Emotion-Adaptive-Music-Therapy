@@ -1,0 +1,12 @@
+# Backend (Python 3.11). Install: python -m pip install -r requirements.txt
+Flask==3.1.3
+flask-cors==6.0.2
+numpy==2.4.4
+scipy==1.17.1
+opencv-python-headless==4.13.0.92
+fer==25.10.3            # facial expression model (pulls in TensorFlow)
+tensorflow==2.21.0
+transformers==5.4.0     # DistilRoBERTa emotion model for the check-in text
+torch==2.11.0
+matplotlib==3.10.8      # charts in scripts/
+pytest==9.2.0
